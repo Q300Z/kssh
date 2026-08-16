@@ -1,0 +1,25 @@
+# Fichiers et répertoires temporaires de tests
+/tmp/
+*.log
+*.tmp
+mock.kdbx
+*.kdbx
+*.key
+mock_id_*
+
+# Clés et certificats locaux
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.pem
+
+# IDEs et éditeurs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Fichiers système
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1065 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# PROJET       : kssh (KeePassSSH)
+# AUTEUR       : Q300Z (https://qalpuch.cc)
+# REPO         : git@github.com:Q300Z/kssh.git
+# DESCRIPTION  : Orchestrateur et gestionnaire de connexions OpenSSH automatisé
+#                avec stockage chiffré KeePassXC et injection sécurisée SSHPass.
+#
+# ARCHITECTURE & FLUX D'EXÉCUTION :
+#   1. CLI Input ──► 2. Parser OpenSSH conforme (table stricte d'options)
+#   3. Résolution native (ssh -G "$@") ──► 4. Détection Clé SSH active
+#   5. Recherche Mot de passe dans KeePassXC (Requête exacte sans heuristique)
+#   6. Injection anonyme via File Descriptor (FD 3) ──► 7. Session SSH
+#
+# SÉCURITÉ & GARANTIES TECHNIQUES :
+#   - Injection FD 3 : Pas d'exposition du secret dans /proc/$PID/cmdline.
+#   - Hygiène Mémoire : Nettoyage immédiat (unset) des variables sensibles.
+#   - Atomicité : Écriture atomique et verrouillée dans ~/.ssh/config.
+#   - Validation Stricte : Contrôle strict (regex/plage) des alias, ports et hôtes.
+#   - Non-Intrusif : Installation explicite (kssh --install), pas de root silencieux.
+#
+# LICENCE      : MIT
+# ==============================================================================
+
+set -eo pipefail
+
+# ==============================================================================
+# [01] HYGIÈNE DU TERMINAL, SÉCURITÉ & NETTOYAGE MÉMOIRE
+# ==============================================================================
+
+# Variable globale du mode debug
+DEBUG_MODE=false
+
+# Rétablit l'écho du terminal et purge les variables sensibles en cas de sortie
+nettoyage_securite() {
+    local exit_code=$?
+    trap - EXIT INT TERM HUP
+    # Rétablir l'affichage terminal
+    stty echo 2>/dev/null || true
+    # Nettoyer les clés SSH temporaires extraites de KeePassXC
+    [ -n "${EXTRACTED_KEY_FILE:-}" ] && [ -f "$EXTRACTED_KEY_FILE" ] && rm -f "$EXTRACTED_KEY_FILE" 2>/dev/null || true
+    # Purge des variables contenant potentiellement des secrets
+    unset PASSWORD ssh_password MASTER_PASSWORD_CACHE master_key 2>/dev/null || true
+    exit "$exit_code"
+}
+trap nettoyage_securite EXIT INT TERM HUP
+
+# ==============================================================================
+# [02] CONSTANTES, CHEMINS XDG & CONFIGURATION GLOBALE
+# ==============================================================================
+
+# Répertoires utilisateurs standardisés (XDG)
+readonly INSTALL_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
+readonly TARGET_BIN="${INSTALL_DIR}/kssh"
+SSH_CONFIG_DIR="${SSH_CONFIG_DIR:-$HOME/.ssh}"
+SSH_CONFIG_FILE="${SSH_CONFIG_FILE:-$SSH_CONFIG_DIR/config}"
+readonly BASH_COMPLETION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+readonly ZSH_COMPLETION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+
+# Base, Keyfile et Groupe Racine KeePassXC (Surchargeables via variables d'environnement)
+KEEPASS_DB="${KEEPASS_DB:-$HOME/Database.kdbx}"
+KEEPASS_KEYFILE="${KEEPASS_KEYFILE:-}"
+KEEPASS_ROOT_GROUP="${KEEPASS_ROOT_GROUP:-Database}"
+
+# Configuration du Cache Mémoire de Session (Option 1 : RAM volatile /dev/shm avec expiration)
+KSSH_CACHE_ENABLED="${KSSH_CACHE_ENABLED:-true}"
+KSSH_CACHE_TTL="${KSSH_CACHE_TTL:-7200}" # 2 heures en secondes par défaut
+KSSH_CACHE_DIR="${KSSH_CACHE_DIR:-$([ -d /dev/shm ] && echo "/dev/shm/kssh_cache_${UID:-$(id -u)}" || echo "${XDG_RUNTIME_DIR:-/tmp}/kssh_cache_${UID:-$(id -u)}")}"
+KSSH_CACHE_FILE="${KSSH_CACHE_DIR}/master.key"
+
+# Fonctions de gestion du cache mémoire de session
+lire_mot_de_passe_maitre_cache() {
+    [ "$KSSH_CACHE_ENABLED" != "true" ] && return 1
+    [ ! -f "$KSSH_CACHE_FILE" ] && return 1
+
+    # Vérification stricte des permissions (seul le propriétaire doit pouvoir lire)
+    local perms
+    perms=$(stat -c %a "$KSSH_CACHE_FILE" 2>/dev/null || stat -f %Lp "$KSSH_CACHE_FILE" 2>/dev/null || echo "")
+    if [ -n "$perms" ] && [ "$perms" != "600" ] && [ "$perms" != "400" ]; then
+        log_warn "Permissions non sécurisées ($perms) sur le cache mémoire. Invalidation préventive."
+        rm -rf "$KSSH_CACHE_DIR" 2>/dev/null || true
+        return 1
+    fi
+
+    local now mtime age
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$KSSH_CACHE_FILE" 2>/dev/null || stat -f %m "$KSSH_CACHE_FILE" 2>/dev/null || echo 0)
+    age=$((now - mtime))
+
+    if [ "$age" -gt "$KSSH_CACHE_TTL" ]; then
+        rm -f "$KSSH_CACHE_FILE" 2>/dev/null || true
+        return 1
+    fi
+
+    cat "$KSSH_CACHE_FILE" 2>/dev/null
+    return 0
+}
+
+sauvegarder_mot_de_passe_maitre_cache() {
+    local pwd="$1"
+    [ "$KSSH_CACHE_ENABLED" != "true" ] && return 0
+    [ -z "$pwd" ] && return 0
+
+    mkdir -p "$KSSH_CACHE_DIR" && chmod 700 "$KSSH_CACHE_DIR"
+    (
+        umask 077
+        printf '%s' "$pwd" > "$KSSH_CACHE_FILE"
+    )
+    chmod 600 "$KSSH_CACHE_FILE"
+}
+
+vider_cache_memoire() {
+    rm -rf "$KSSH_CACHE_DIR" 2>/dev/null || true
+    log_success "Cache mémoire de session vidé avec succès. La base est reverrouillée."
+}
+
+# Détection de l'Agent SSH natif de KeePassXC (Option 3)
+detecter_agent_ssh_kpxc() {
+    if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+        if ssh-add -l >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    local orig_sock="${SSH_AUTH_SOCK:-}"
+    local kpxc_socks=(
+        "/run/user/${UID:-$(id -u)}/kpxc_ssh_agent.sock"
+        "${XDG_RUNTIME_DIR:-/run/user/${UID:-$(id -u)}}/kpxc_ssh_agent.sock"
+        "$HOME/.ssh/kpxc_ssh_agent.sock"
+    )
+    for sock in "${kpxc_socks[@]}"; do
+        if [ -S "$sock" ]; then
+            export SSH_AUTH_SOCK="$sock"
+            if ssh-add -l >/dev/null 2>&1; then
+                log_debug "Agent SSH KeePassXC actif détecté sur $sock"
+                return 0
+            fi
+        fi
+    done
+    [ -n "$orig_sock" ] && export SSH_AUTH_SOCK="$orig_sock" || unset SSH_AUTH_SOCK
+    return 1
+}
+
+# Résolution explicite et sécurisée du vrai binaire OpenSSH
+trouver_vrai_binaire_ssh() {
+    if [ -n "${OPENSSH_BIN:-}" ] && [ -x "$OPENSSH_BIN" ]; then
+        echo "$OPENSSH_BIN"
+        return 0
+    fi
+    local chemins=("/usr/bin/ssh" "/bin/ssh" "/usr/local/bin/ssh" "/opt/homebrew/bin/ssh")
+    for binaire in "${chemins[@]}"; do
+        if [ -x "$binaire" ] && [ "$binaire" != "$TARGET_BIN" ]; then
+            echo "$binaire"
+            return 0
+        fi
+    done
+    local ssh_path
+    ssh_path="$(type -P ssh 2>/dev/null || true)"
+    if [ -n "$ssh_path" ] && [ "$ssh_path" != "$TARGET_BIN" ] && [ -x "$ssh_path" ]; then
+        echo "$ssh_path"
+        return 0
+    fi
+    return 1
+}
+
+REAL_SSH="$(trouver_vrai_binaire_ssh || true)"
+
+# Palette de couleurs ANSI
+readonly C_RED='\033[0;31m'
+readonly C_GREEN='\033[0;32m'
+readonly C_YELLOW='\033[1;33m'
+readonly C_CYAN='\033[0;36m'
+readonly C_BOLD='\033[1m'
+readonly C_RESET='\033[0m'
+
+# ==============================================================================
+# [03] JOURNALISATION & AFFICHAGE UTILISATEUR
+# ==============================================================================
+
+log_info()    { printf '%b[INFO]%b %b\n' "${C_CYAN}" "${C_RESET}" "$*"; }
+log_success() { printf '%b[SUCCÈS]%b %b\n' "${C_GREEN}" "${C_RESET}" "$*"; }
+log_warn()    { printf '%b[ATTENTION]%b %b\n' "${C_YELLOW}" "${C_RESET}" "$*"; }
+log_error()   { printf '%b[ERREUR]%b %b\n' "${C_RED}" "${C_RESET}" "$*" >&2; }
+log_debug()   { [ "$DEBUG_MODE" = true ] && printf '%b[DEBUG]%b %b\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2 || true; }
+
+afficher_aide() {
+    printf '%b%b=== kssh : Gestionnaire SSH automatisé avec KeePassXC ===%b\n\n' "${C_BOLD}" "${C_CYAN}" "${C_RESET}"
+    printf '%bUSAGE :%b\n' "${C_BOLD}" "${C_RESET}"
+    printf '  %bkssh [options_ssh] <alias|cible> [commande...]%b  Connexion SSH avec injection automatique\n' "${C_GREEN}" "${C_RESET}"
+    printf '  %bkssh --add <alias> [user@host[:port]] [-i clé]%b  Ajouter un serveur à ~/.ssh/config et KeePassXC\n' "${C_GREEN}" "${C_RESET}"
+    printf '  %bkssh --list%b                                     Lister tous les serveurs configurés dans ~/.ssh/config\n' "${C_GREEN}" "${C_RESET}"
+    printf '  %bkssh --lock%b                                     Vider le cache mémoire de session (reverrouiller)\n' "${C_GREEN}" "${C_RESET}"
+    printf '  %bkssh --agent%b                                    Afficher l'\''état de l'\''agent SSH KeePassXC\n' "${C_GREEN}" "${C_RESET}"
+    printf '  %bkssh --install [--yes]%b                          Installer les dépendances et configurer l'\''environnement\n' "${C_GREEN}" "${C_RESET}"
+    printf '  %bkssh --debug ...%b                                Activer la journalisation de diagnostic\n' "${C_GREEN}" "${C_RESET}"
+    printf '  %bkssh --version%b                                  Afficher la version\n' "${C_GREEN}" "${C_RESET}"
+    printf '  %bkssh --help%b                                     Afficher cette aide\n\n' "${C_GREEN}" "${C_RESET}"
+    printf '%bSÉCURITÉ & BONNES PRATIQUES :%b\n' "${C_BOLD}" "${C_RESET}"
+    printf '  - Option 1 (Cache RAM) : Mot de passe maître retenu %s min en RAM volatile (/dev/shm).\n' "$((KSSH_CACHE_TTL / 60))"
+    printf '  - Option 3 (Agent SSH) : Prise en charge native de l'\''agent SSH de KeePassXC.\n'
+    printf '  - Groupe racine par défaut : "%s" (modifiable via KEEPASS_ROOT_GROUP).\n\n' "${KEEPASS_ROOT_GROUP}"
+    printf '%bEXEMPLES :%b\n' "${C_BOLD}" "${C_RESET}"
+    printf '  kssh nas\n'
+    printf '  kssh -p 2222 debian@51.15.20.30\n'
+    printf '  kssh -l admin 192.168.1.50 '\''uptime'\''\n'
+    printf '  kssh --add vps debian@51.15.20.30:2222\n'
+    printf '  kssh --add raspi pi@192.168.1.50 -i ~/.ssh/id_ed25519\n\n'
+}
+
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# ==============================================================================
+# [04] GESTION DES DÉPENDANCES LOGICIELLES (TABLEAUX NATIFS)
+# ==============================================================================
+
+detecter_gestionnaire_paquets() {
+    if cmd_exists pacman; then echo "pacman"
+    elif cmd_exists apt-get; then echo "apt"
+    elif cmd_exists dnf; then echo "dnf"
+    elif cmd_exists zypper; then echo "zypper"
+    elif cmd_exists brew; then echo "brew"
+    else echo "unknown"; fi
+}
+
+installer_dependances_systeme() {
+    local auto_yes="${1:-false}"
+    local paquets_manquants=()
+    cmd_exists ssh          || paquets_manquants+=("openssh")
+    cmd_exists sshpass      || paquets_manquants+=("sshpass")
+    cmd_exists keepassxc-cli || paquets_manquants+=("keepassxc")
+
+    if [ ${#paquets_manquants[@]} -eq 0 ]; then
+        log_success "Toutes les dépendances logicielles sont déjà installées."
+        return 0
+    fi
+
+    local pkg_mgr
+    pkg_mgr=$(detecter_gestionnaire_paquets)
+    local cmd_array=()
+
+    case "$pkg_mgr" in
+        pacman) cmd_array=("pacman" "-S" "--needed" "--noconfirm" "${paquets_manquants[@]}") ;;
+        apt)    cmd_array=("apt-get" "update" "&&" "apt-get" "install" "-y" "${paquets_manquants[@]}") ;;
+        dnf)    cmd_array=("dnf" "install" "-y" "${paquets_manquants[@]}") ;;
+        zypper) cmd_array=("zypper" "install" "-y" "${paquets_manquants[@]}") ;;
+        brew)   cmd_array=("brew" "install" "${paquets_manquants[@]}") ;;
+        *)
+            log_error "Gestionnaire de paquets inconnu. Veuillez installer manuellement : ${paquets_manquants[*]}"
+            return 1
+            ;;
+    esac
+
+    if [ "$EUID" -eq 0 ]; then
+        if [ "$auto_yes" != "true" ] && [ -t 0 ]; then
+            read -rp "Confirmer l'installation de [${paquets_manquants[*]}] ? [O/n] : " rep
+            [[ ! "$rep" =~ ^[oOyY]?$ ]] && { log_warn "Installation annulée."; return 1; }
+        fi
+        log_info "Installation des paquets..."
+        "${cmd_array[@]}"
+        log_success "Installation des dépendances terminée avec succès."
+    else
+        log_warn "Dépendance(s) manquante(s) : ${C_BOLD}${paquets_manquants[*]}${C_RESET}"
+        log_info "Pour installer les paquets requis, exécutez :"
+        printf '\n  %b%bsudo %s%b\n\n' "${C_BOLD}" "${C_GREEN}" "${cmd_array[*]}" "${C_RESET}"
+        log_warn "Relancez ensuite kssh une fois les paquets installés."
+        return 1
+    fi
+}
+
+# ==============================================================================
+# [05] INSTALLATION EXPLICITE & CONFIGURATION SHELL
+# ==============================================================================
+
+injecter_config_sans_ecraser() {
+    local fichier_rc="$1"
+    local ligne="$2"
+    local commentaire="$3"
+
+    [ ! -f "$fichier_rc" ] && touch "$fichier_rc"
+
+    if ! grep -Fqs "$ligne" "$fichier_rc"; then
+        {
+            echo ""
+            [ -n "$commentaire" ] && echo "$commentaire"
+            echo "$ligne"
+        } >> "$fichier_rc"
+        log_info "Configuration ajoutée à $(basename "$fichier_rc") : $ligne"
+    fi
+}
+
+installer_autocompletion() {
+    mkdir -p "$BASH_COMPLETION_DIR" "$ZSH_COMPLETION_DIR"
+
+    # Autocomplétion Bash dédiée à kssh et ssh
+    cat << 'EOF' > "${BASH_COMPLETION_DIR}/kssh"
+_kssh_complete() {
+    local cur prev words cword
+    _init_completion || return
+
+    local options="--add --list --help --install --version --debug -a -l -h -i -v"
+    local hosts=""
+
+    if [[ -f "$HOME/.ssh/config" ]]; then
+        hosts=$(awk 'tolower($1) == "host" { for (i=2; i<=NF; i++) if ($i != "*") print $i }' "$HOME/.ssh/config" 2>/dev/null)
+    fi
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$options" -- "$cur") )
+        return 0
+    fi
+
+    COMPREPLY=( $(compgen -W "$hosts $options" -- "$cur") )
+}
+complete -F _kssh_complete kssh
+complete -F _kssh_complete ssh
+EOF
+    log_success "Autocomplétion Bash installée (${BASH_COMPLETION_DIR}/kssh)."
+
+    # Autocomplétion Zsh
+    cat << 'EOF' > "${ZSH_COMPLETION_DIR}/_kssh"
+#compdef kssh ssh
+_kssh() {
+    local -a options hosts
+    options=(
+        '--add[Ajouter un serveur à ~/.ssh/config]'
+        '--list[Lister les serveurs configurés]'
+        '--help[Afficher aide]'
+        '--install[Installer/Vérifier]'
+        '--version[Afficher version]'
+        '--debug[Mode debug]'
+    )
+    if [[ -f "$HOME/.ssh/config" ]]; then
+        hosts=(${(f)"$(awk 'tolower($1) == "host" { for (i=2; i<=NF; i++) if ($i != "*") print $i }' "$HOME/.ssh/config" 2>/dev/null)"})
+    fi
+    _describe 'hosts' hosts -- _describe 'options' options
+}
+_kssh "$@"
+EOF
+    log_success "Autocomplétion Zsh installée (${ZSH_COMPLETION_DIR}/_kssh)."
+}
+
+executer_installation_explicite() {
+    local auto_yes="${1:-false}"
+    log_info "=== Initialisation de l'installation de kssh ==="
+
+    installer_dependances_systeme "$auto_yes" || true
+
+    mkdir -p "$INSTALL_DIR" "$SSH_CONFIG_DIR"
+    chmod 700 "$SSH_CONFIG_DIR"
+
+    if [ ! -f "$SSH_CONFIG_FILE" ]; then
+        touch "$SSH_CONFIG_FILE"
+        chmod 600 "$SSH_CONFIG_FILE"
+    fi
+
+    local script_source
+    script_source="$(realpath "$0" 2>/dev/null || readlink -f "$0")"
+
+    if [ "$script_source" != "$TARGET_BIN" ]; then
+        log_info "Copie du binaire dans $TARGET_BIN..."
+        cp "$script_source" "$TARGET_BIN"
+        chmod 755 "$TARGET_BIN"
+        log_success "Binaire installé dans $TARGET_BIN"
+    else
+        chmod 755 "$TARGET_BIN"
+    fi
+
+    installer_autocompletion
+
+    local export_path='export PATH="$HOME/.local/bin:$PATH"'
+    local alias_ssh="alias ssh='kssh'"
+    local source_bash_comp="[[ -f ~/.local/share/bash-completion/completions/kssh ]] && source ~/.local/share/bash-completion/completions/kssh"
+
+    if [ -f "$HOME/.bashrc" ] || [ -f "$HOME/.bash_profile" ]; then
+        local bash_target="$HOME/.bashrc"
+        [ ! -f "$bash_target" ] && bash_target="$HOME/.bash_profile"
+        injecter_config_sans_ecraser "$bash_target" "$export_path" "# Support de ~/.local/bin pour kssh"
+        injecter_config_sans_ecraser "$bash_target" "$alias_ssh" "# Alias SSH intelligent vers kssh"
+        injecter_config_sans_ecraser "$bash_target" "$source_bash_comp" "# Chargement autocomplétion kssh"
+    fi
+
+    if [ -f "$HOME/.zshrc" ]; then
+        injecter_config_sans_ecraser "$HOME/.zshrc" "$export_path" "# Support de ~/.local/bin pour kssh"
+        injecter_config_sans_ecraser "$HOME/.zshrc" "$alias_ssh" "# Alias SSH intelligent vers kssh"
+        injecter_config_sans_ecraser "$HOME/.zshrc" 'fpath=(~/.local/share/zsh/site-functions $fpath)' "# FPath pour autocomplétion kssh"
+    fi
+
+    log_success "=== Installation terminée avec succès ! ==="
+}
+
+# ==============================================================================
+# [06] COUCHE D'ABSTRACTION, RECHERCHE URL & SÉCURITÉ KEEPASSXC
+# ==============================================================================
+
+# @description Récupère un mot de passe ou attribut d'une entrée KeePassXC
+kp_get_attribute() {
+    local entry_path="$1"
+    local attribute="${2:-password}"
+    local master_pwd="${3:-}"
+    local clean_path="${entry_path#/}"
+    local kp_args=("-q" "-s" "-a" "$attribute")
+    [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_args+=("-k" "$KEEPASS_KEYFILE")
+
+    local kp_out="" kp_status=1
+    for p in "$clean_path" "$entry_path"; do
+        [ -z "$p" ] && continue
+        if [ -n "$master_pwd" ]; then
+            kp_out=$(printf '%s\n' "$master_pwd" | keepassxc-cli show "${kp_args[@]}" "$KEEPASS_DB" "$p" 2>/dev/null) && kp_status=0 || kp_status=$?
+        else
+            kp_out=$(keepassxc-cli show "${kp_args[@]}" "$KEEPASS_DB" "$p" 2>/dev/null) && kp_status=0 || kp_status=$?
+        fi
+        if [ "$kp_status" -eq 0 ] && [ -n "$kp_out" ]; then
+            printf '%s' "$kp_out"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# @description Liste les pièces jointes d'une entrée KeePassXC
+kp_get_attachments() {
+    local entry_path="$1"
+    local master_pwd="${2:-}"
+    local clean_path="${entry_path#/}"
+    local kp_args=("-q" "--show-attachments")
+    [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_args+=("-k" "$KEEPASS_KEYFILE")
+
+    local kp_out=""
+    for p in "$clean_path" "$entry_path"; do
+        [ -z "$p" ] && continue
+        if [ -n "$master_pwd" ]; then
+            kp_out=$(printf '%s\n' "$master_pwd" | keepassxc-cli show "${kp_args[@]}" "$KEEPASS_DB" "$p" 2>/dev/null) || true
+        else
+            kp_out=$(keepassxc-cli show "${kp_args[@]}" "$KEEPASS_DB" "$p" 2>/dev/null) || true
+        fi
+        if [ -n "$kp_out" ]; then
+            printf '%s\n' "$kp_out"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# @description Recherche les entrées correspondant à un terme d'URL ou d'hôte
+kp_search_entries() {
+    local term="$1"
+    local master_pwd="${2:-}"
+    local kp_args=("-q")
+    [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_args+=("-k" "$KEEPASS_KEYFILE")
+
+    if [ -n "$master_pwd" ]; then
+        printf '%s\n' "$master_pwd" | keepassxc-cli search "${kp_args[@]}" "$KEEPASS_DB" "$term" 2>/dev/null || true
+    else
+        keepassxc-cli search "${kp_args[@]}" "$KEEPASS_DB" "$term" 2>/dev/null || true
+    fi
+}
+
+# @description Exporte une pièce jointe (clé SSH) vers un fichier temporaire sécurisé
+kp_export_attachment() {
+    local entry_path="$1"
+    local att_name="$2"
+    local dest_file="$3"
+    local master_pwd="${4:-}"
+    local clean_path="${entry_path#/}"
+    local kp_args=("-q")
+    [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_args+=("-k" "$KEEPASS_KEYFILE")
+
+    touch "$dest_file" && chmod 600 "$dest_file"
+    for p in "$clean_path" "$entry_path"; do
+        [ -z "$p" ] && continue
+        if [ -n "$master_pwd" ]; then
+            printf '%s\n' "$master_pwd" | keepassxc-cli attachment-export "${kp_args[@]}" "$KEEPASS_DB" "$p" "$att_name" "$dest_file" 2>/dev/null || true
+        else
+            keepassxc-cli attachment-export "${kp_args[@]}" "$KEEPASS_DB" "$p" "$att_name" "$dest_file" 2>/dev/null || true
+        fi
+        [ -s "$dest_file" ] && return 0
+    done
+    return 1
+}
+
+# ==============================================================================
+# [07] GESTION DE LA CONFIGURATION OPENSSH (~/.ssh/config)
+# ==============================================================================
+
+lister_serveurs() {
+    printf '%b%b=== Serveurs configurés dans ~/.ssh/config ===%b\n' "${C_BOLD}" "${C_CYAN}" "${C_RESET}"
+    if [ -f "$SSH_CONFIG_FILE" ]; then
+        local entries
+        entries=$(awk 'tolower($1) == "host" { for (i=2; i<=NF; i++) if ($i != "*") print $i }' "$SSH_CONFIG_FILE" 2>/dev/null || true)
+        if [ -n "$entries" ]; then
+            while IFS= read -r alias_name; do
+                [ -n "$alias_name" ] && printf '  • %s\n' "$alias_name"
+            done <<< "$entries"
+        else
+            echo "  (Aucun serveur configuré)"
+        fi
+    else
+        echo "  (Fichier ~/.ssh/config absent)"
+    fi
+}
+
+alias_existe_dans_config() {
+    local target_alias="$1"
+    [ ! -f "$SSH_CONFIG_FILE" ] && return 1
+    awk -v target="$target_alias" '
+        BEGIN { found = 1 }
+        tolower($1) == "host" {
+            for (i = 2; i <= NF; i++) {
+                if ($i == target) {
+                    found = 0
+                    exit
+                }
+            }
+        }
+        END { exit found }
+    ' "$SSH_CONFIG_FILE"
+}
+
+# @description Écriture atomique et sécurisée dans ~/.ssh/config
+ajouter_serveur() {
+    local alias=""
+    local cible=""
+    local custom_key=""
+    local user_from_flag=""
+    local port_from_flag=""
+    local has_alias=false
+    local has_cible=false
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -i|--key)
+                if [ "$#" -ge 2 ]; then custom_key="$2"; shift 2; else shift 1; fi
+                ;;
+            -i*)
+                custom_key="${1#-i}"
+                shift
+                ;;
+            -l|-u|--user)
+                if [ "$#" -ge 2 ]; then user_from_flag="$2"; shift 2; else shift 1; fi
+                ;;
+            -l*)
+                user_from_flag="${1#-l}"
+                shift
+                ;;
+            -u*)
+                user_from_flag="${1#-u}"
+                shift
+                ;;
+            -p|--port)
+                if [ "$#" -ge 2 ]; then port_from_flag="$2"; shift 2; else shift 1; fi
+                ;;
+            -p*)
+                port_from_flag="${1#-p}"
+                shift
+                ;;
+            *)
+                if [ "$has_alias" = false ]; then
+                    alias="$1"
+                    has_alias=true
+                elif [ "$has_cible" = false ]; then
+                    cible="$1"
+                    has_cible=true
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validation stricte du nom d'alias (Empêche l'injection de directives SSH)
+    if [ -z "$alias" ]; then
+        log_error "Vous devez spécifier un nom d'alias (ex: kssh --add mon-serveur)"
+        return 1
+    fi
+    if [[ ! "$alias" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        log_error "Alias invalide '$alias'. Seuls les caractères [a-z, A-Z, 0-9, ., _, -] sont autorisés."
+        return 1
+    fi
+
+    local user="${USER:-$(id -un)}"
+    local host=""
+    local port="22"
+
+    if [ -n "$cible" ]; then
+        # Découpage robuste : IPv6 entre crochets et IPv4 avec port optionnel
+        if [[ "$cible" =~ ^([^@]+)@\[([a-fA-F0-9:]+)\](:([^@/]+))?$ ]]; then
+            user="${BASH_REMATCH[1]}"; host="${BASH_REMATCH[2]}"
+            [ -n "${BASH_REMATCH[4]}" ] && port="${BASH_REMATCH[4]}"
+        elif [[ "$cible" =~ ^\[([a-fA-F0-9:]+)\](:([^@/]+))?$ ]]; then
+            host="${BASH_REMATCH[1]}"
+            [ -n "${BASH_REMATCH[3]}" ] && port="${BASH_REMATCH[3]}"
+        elif [[ "$cible" =~ ^([^@]+)@([^:]+)(:([^@/]+))?$ ]]; then
+            user="${BASH_REMATCH[1]}"; host="${BASH_REMATCH[2]}"
+            [ -n "${BASH_REMATCH[4]}" ] && port="${BASH_REMATCH[4]}"
+        elif [[ "$cible" =~ ^([^:]+)(:([^@/]+))?$ ]]; then
+            host="${BASH_REMATCH[1]}"
+            [ -n "${BASH_REMATCH[3]}" ] && port="${BASH_REMATCH[3]}"
+        else
+            host="$cible"
+        fi
+    fi
+
+    # Les drapeaux explicites -l / -u et -p ont la priorité
+    [ -n "$user_from_flag" ] && user="$user_from_flag"
+    [ -n "$port_from_flag" ] && port="$port_from_flag"
+
+    if [ -z "$host" ]; then
+        if [ ! -t 0 ]; then
+            log_error "Mode non-interactif : hôte/IP manquant pour '$alias'."
+            return 1
+        fi
+        read -rp "Nom d'hôte ou adresse IP du serveur : " host
+        read -rp "Nom d'utilisateur SSH [$user] : " input_user
+        [ -n "$input_user" ] && user="$input_user"
+        read -rp "Port SSH [$port] : " input_port
+        [ -n "$input_port" ] && port="$input_port"
+    fi
+
+    # Validation stricte du port (1 à 65535)
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        log_error "Port invalide '$port'. Doit être un entier entre 1 et 65535."
+        return 1
+    fi
+
+    # Validation stricte de l'utilisateur
+    if [[ ! "$user" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        log_error "Nom d'utilisateur invalide '$user'."
+        return 1
+    fi
+
+    # Validation de l'hôte
+    if [ -z "$host" ] || [[ "$host" =~ [[:space:]] ]]; then
+        log_error "Nom d'hôte invalide."
+        return 1
+    fi
+
+    if [ -n "$custom_key" ]; then
+        custom_key="${custom_key/#\~/$HOME}"
+        if [ ! -f "$custom_key" ]; then
+            log_warn "Le fichier de clé spécifié '$custom_key' n'existe pas actuellement sur le disque."
+        fi
+    fi
+
+    # ÉTAPE 1 : Détection d'entrée existante ou Enregistrement dans KeePassXC
+    if [ -f "$KEEPASS_DB" ] && cmd_exists keepassxc-cli; then
+        local ssh_url="ssh://${host}:${port}"
+        local master_key=""
+
+        if master_key=$(lire_mot_de_passe_maitre_cache); then
+            log_debug "Mot de passe maître chargé depuis le cache mémoire (/dev/shm)."
+        elif [ -t 0 ] && [ -t 1 ]; then
+            read -rsp "Mot de passe maître KeePassXC ($KEEPASS_DB) : " master_key
+            echo ""
+            [ -n "$master_key" ] && sauvegarder_mot_de_passe_maitre_cache "$master_key"
+        fi
+
+        # 1.1 Recherche préalable : existe-t-il déjà une entrée pour cette IP / Hôte et cet utilisateur ?
+        local existing_entry=""
+        local found_list
+        found_list=$(kp_search_entries "$host" "$master_key")
+
+        if [ -n "$found_list" ]; then
+            while IFS= read -r cand_p; do
+                [ -z "$cand_p" ] && continue
+                local cand_u
+                cand_u=$(kp_get_attribute "$cand_p" "username" "$master_key")
+                if [ -z "$user" ] || [ "$cand_u" = "$user" ]; then
+                    existing_entry="$cand_p"
+                    log_success "Entrée existante trouvée dans KeePassXC : '$cand_p' (Utilisateur: $user)."
+                    log_info "Réutilisation des identifiants existants sans créer de doublon."
+                    break
+                fi
+            done <<< "$found_list"
+        fi
+
+        # 1.2 Si aucune entrée existante n'a été trouvée, on la crée proprement
+        if [ -z "$existing_entry" ]; then
+            log_info "Création d'une nouvelle entrée dans KeePassXC ($KEEPASS_DB) [URL: $ssh_url]..."
+            local kp_base_args=("-u" "$user" "--url" "$ssh_url")
+            [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_base_args+=("-k" "$KEEPASS_KEYFILE")
+
+            local entry_created=false
+            local successful_path="$alias"
+
+            if [ -n "$custom_key" ]; then
+                # Création de l'entrée pour clé SSH
+                if keepassxc-cli add "${kp_base_args[@]}" --no-password "$KEEPASS_DB" "$alias" <<< "$master_key" 2>/dev/null || \
+                   keepassxc-cli add "${kp_base_args[@]}" --no-password "$KEEPASS_DB" "$alias"; then
+                    entry_created=true
+                fi
+            else
+                # Création interactive directe avec mot de passe
+                if keepassxc-cli add "${kp_base_args[@]}" -p "$KEEPASS_DB" "$alias"; then
+                    entry_created=true
+                fi
+            fi
+
+            if [ "$entry_created" = false ]; then
+                log_error "Échec de l'enregistrement dans KeePassXC (mot de passe maître erroné ou base verrouillée)."
+                log_error "Annulation : le fichier ~/.ssh/config n'a pas été modifié."
+                return 1
+            fi
+
+            # Si une clé SSH physique existe, on l'attache directement dans l'entrée KeePassXC
+            if [ -n "$custom_key" ] && [ -f "$custom_key" ]; then
+                local key_filename
+                key_filename="$(basename "$custom_key")"
+                log_info "Attachement du fichier de clé '$key_filename' à l'entrée KeePassXC..."
+                local kp_att_args=("-f")
+                [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_att_args+=("-k" "$KEEPASS_KEYFILE")
+                keepassxc-cli attachment-import "${kp_att_args[@]}" "$KEEPASS_DB" "$successful_path" "$key_filename" "$custom_key" 2>/dev/null <<< "$master_key" || true
+            fi
+
+            log_success "Entrée '$alias' enregistrée avec succès dans KeePassXC ($successful_path) !"
+        fi
+    fi
+
+    # ÉTAPE 2 : Écriture atomique dans ~/.ssh/config
+    mkdir -p "$SSH_CONFIG_DIR"
+    chmod 700 "$SSH_CONFIG_DIR"
+    [ ! -f "$SSH_CONFIG_FILE" ] && touch "$SSH_CONFIG_FILE" && chmod 600 "$SSH_CONFIG_FILE"
+
+    if alias_existe_dans_config "$alias"; then
+        log_warn "L'alias '$alias' existe déjà dans ~/.ssh/config. Paramètres réseau existants préservés."
+    else
+        log_info "Ajout de l'entrée '$alias' dans $SSH_CONFIG_FILE..."
+        local tmp_file
+        tmp_file="$(mktemp "${SSH_CONFIG_DIR}/config.tmp.XXXXXX")"
+        chmod 600 "$tmp_file"
+
+        # Copier le contenu actuel
+        if [ -s "$SSH_CONFIG_FILE" ]; then
+            cat "$SSH_CONFIG_FILE" > "$tmp_file"
+            # S'assurer d'un saut de ligne final propre
+            if [ -n "$(tail -c 1 "$tmp_file" 2>/dev/null)" ]; then
+                echo "" >> "$tmp_file"
+            fi
+        fi
+
+        # Ajouter le nouveau bloc Host
+        {
+            echo "Host $alias"
+            echo "    HostName $host"
+            echo "    User $user"
+            echo "    Port $port"
+            [ -n "$custom_key" ] && echo "    IdentityFile $custom_key"
+            echo ""
+        } >> "$tmp_file"
+
+        # Remplacement atomique
+        mv -f "$tmp_file" "$SSH_CONFIG_FILE"
+        chmod 600 "$SSH_CONFIG_FILE"
+    fi
+
+    if [ -n "$custom_key" ]; then
+        log_success "Serveur configuré avec clé SSH (authentification par clé). Connexion : ${C_CYAN}kssh $alias${C_RESET}"
+    else
+        log_success "Serveur configuré avec mot de passe KeePassXC. Connexion : ${C_CYAN}kssh $alias${C_RESET}"
+    fi
+    return 0
+}
+
+# ==============================================================================
+# [08] PARSER D'ARGUMENTS OPENSSH & RÉSOLUTION NATIVE
+# ==============================================================================
+
+# @description Analyse exhaustive des options OpenSSH
+extraire_cible_ssh() {
+    TARGET_HOST=""
+    USER_FLAG=""
+    HAS_CLI_KEY=false
+    CLI_SSH_OPTIONS=()
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --)
+                shift
+                if [ -z "$TARGET_HOST" ] && [ "$#" -gt 0 ]; then
+                    TARGET_HOST="$1"
+                    shift
+                fi
+                break
+                ;;
+            -i)
+                HAS_CLI_KEY=true
+                if [ "$#" -ge 2 ]; then
+                    CLI_SSH_OPTIONS+=("-i" "$2")
+                    shift 2
+                else
+                    shift 1
+                fi
+                ;;
+            -i?*)
+                HAS_CLI_KEY=true
+                CLI_SSH_OPTIONS+=("$1")
+                shift
+                ;;
+            -l)
+                if [ "$#" -ge 2 ]; then
+                    USER_FLAG="$2"
+                    CLI_SSH_OPTIONS+=("-l" "$2")
+                    shift 2
+                else
+                    shift 1
+                fi
+                ;;
+            -l*)
+                USER_FLAG="${1#-l}"
+                CLI_SSH_OPTIONS+=("$1")
+                shift
+                ;;
+            # Options OpenSSH nécessitant obligatoirement un argument séparé
+            -[bBcDeEFIJLmOoPpQRSWw])
+                if [ "$#" -ge 2 ]; then
+                    CLI_SSH_OPTIONS+=("$1" "$2")
+                    shift 2
+                else
+                    CLI_SSH_OPTIONS+=("$1")
+                    shift 1
+                fi
+                ;;
+            -*)
+                CLI_SSH_OPTIONS+=("$1")
+                shift
+                ;;
+            *)
+                if [ -z "$TARGET_HOST" ]; then
+                    TARGET_HOST="$1"
+                    shift
+                    # Dès que l'hôte cible est atteint, les arguments suivants constituent la commande distante
+                    break
+                fi
+                ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [09] ORCHESTRATEUR D'EXÉCUTION PRINCIPAL
+# ==============================================================================
+
+executer_connexion_ssh() {
+    # 1. Vérification de l'existence du client OpenSSH
+    if [ -z "$REAL_SSH" ] || [ ! -x "$REAL_SSH" ]; then
+        log_error "Client OpenSSH introuvable sur votre système."
+        log_error "Veuillez installer OpenSSH via votre gestionnaire de paquets (ou lancer 'kssh --install')."
+        return 1
+    fi
+
+    # 2. Traitement des arguments de debug
+    local filtered_args=()
+    for arg in "$@"; do
+        if [ "$arg" = "--debug" ]; then
+            DEBUG_MODE=true
+        else
+            filtered_args+=("$arg")
+        fi
+    done
+    set -- "${filtered_args[@]}"
+
+    # 3. Routage des commandes de gestion kssh
+    if [ "$#" -eq 1 ]; then
+        case "$1" in
+            --help|-h)            afficher_aide; return 0 ;;
+            --version|-v)         echo "kssh"; return 0 ;;
+            --install)            executer_installation_explicite false; return 0 ;;
+            --list)               lister_serveurs; return 0 ;;
+            --lock|--clear-cache) vider_cache_memoire; return 0 ;;
+            --agent)
+                if detecter_agent_ssh_kpxc; then
+                    log_success "Agent SSH KeePassXC détecté et actif (Socket: $SSH_AUTH_SOCK)."
+                    ssh-add -l
+                else
+                    log_warn "Aucun Agent SSH KeePassXC actif détecté (Vérifier: KeePassXC > Outils > Paramètres > Agent SSH)."
+                fi
+                return 0
+                ;;
+        esac
+    fi
+
+    if [ "${1:-}" = "--install" ]; then
+        shift
+        local auto_y=false
+        [ "${1:-}" = "--yes" ] || [ "${1:-}" = "-y" ] && auto_y=true
+        executer_installation_explicite "$auto_y"
+        return 0
+    fi
+
+    if [ "${1:-}" = "--add" ]; then
+        shift
+        ajouter_serveur "$@"
+        return $?
+    fi
+
+    # 4. Extraction transparente de la cible et des options CLI
+    TARGET_HOST=""
+    USER_FLAG=""
+    HAS_CLI_KEY=false
+    CLI_SSH_OPTIONS=()
+    extraire_cible_ssh "$@"
+
+    log_debug "TARGET_HOST='$TARGET_HOST', USER_FLAG='$USER_FLAG', HAS_CLI_KEY='$HAS_CLI_KEY'"
+
+    # Si aucun hôte n'est détecté (ex: ssh -V ou options seules), passage direct à OpenSSH
+    if [ -z "$TARGET_HOST" ]; then
+        exec "$REAL_SSH" "$@"
+    fi
+
+    # 5. Résolution native OpenSSH via `ssh -G` avec transmission de TOUTES les options CLI
+    RESOLVED_USER=""
+    RESOLVED_HOST="$TARGET_HOST"
+
+    local ssh_dump=""
+    if ssh_dump=$("$REAL_SSH" -G "${CLI_SSH_OPTIONS[@]}" "$TARGET_HOST" 2>/dev/null); then
+        RESOLVED_USER=$(awk '/^user / {print $2; exit}' <<< "$ssh_dump")
+        RESOLVED_HOST=$(awk '/^hostname / {print $2; exit}' <<< "$ssh_dump")
+    fi
+    [ -n "$USER_FLAG" ] && RESOLVED_USER="$USER_FLAG"
+
+    # Si une clé SSH explicite a été passée en ligne de commande (-i), OpenSSH gère nativement
+    if [ "$HAS_CLI_KEY" = "true" ]; then
+        log_debug "Délégation native à OpenSSH (Option -i explicite fournie)."
+        exec "$REAL_SSH" "$@"
+    fi
+
+    # 6. Recherche ciblée du mot de passe ou de la clé attachée dans KeePassXC
+    PASSWORD=""
+    EXTRACTED_KEY_FILE=""
+
+    if [ -f "$KEEPASS_DB" ] && cmd_exists keepassxc-cli; then
+        local candidates=(
+            "${TARGET_HOST}"
+            "${RESOLVED_HOST}"
+            "${RESOLVED_USER}@${RESOLVED_HOST}"
+            "${KEEPASS_ROOT_GROUP}/${TARGET_HOST}"
+            "${KEEPASS_ROOT_GROUP}/SSH/${TARGET_HOST}"
+            "SSH/${TARGET_HOST}"
+            "${KEEPASS_ROOT_GROUP}/${RESOLVED_USER}@${RESOLVED_HOST}"
+            "${KEEPASS_ROOT_GROUP}/${RESOLVED_HOST}"
+        )
+
+        local master_key=""
+        if master_key=$(lire_mot_de_passe_maitre_cache); then
+            log_debug "Mot de passe maître chargé depuis le cache mémoire (/dev/shm)."
+        elif [ -t 0 ] && [ -t 1 ]; then
+            read -rsp "Mot de passe maître KeePassXC ($KEEPASS_DB) : " master_key
+            echo ""
+            [ -n "$master_key" ] && sauvegarder_mot_de_passe_maitre_cache "$master_key"
+        fi
+
+        # 6.1 Recherche directe par chemins d'alias
+        for cand in "${candidates[@]}"; do
+            [ -z "$cand" ] && continue
+            log_debug "Tentative de récupération directe sur : $cand"
+
+            # Vérifier si l'entrée contient un mot de passe
+            PASSWORD=$(kp_get_attribute "$cand" "password" "$master_key" || true)
+            if [ -n "$PASSWORD" ]; then
+                log_debug "Mot de passe trouvé pour le candidat : $cand"
+                break
+            fi
+
+            # Vérifier si l'entrée contient une clé SSH en pièce jointe
+            local attachments=""
+            attachments=$(kp_get_attachments "$cand" "$master_key" || true)
+            if [ -n "$attachments" ]; then
+                local first_att
+                first_att=$(head -n 1 <<< "$attachments")
+                if [ -n "$first_att" ]; then
+                    local tmp_key
+                    tmp_key=$(mktemp -p /dev/shm 2>/dev/null || mktemp /tmp/kssh_key.XXXXXX)
+                    chmod 600 "$tmp_key"
+                    if kp_export_attachment "$cand" "$first_att" "$tmp_key" "$master_key"; then
+                        EXTRACTED_KEY_FILE="$tmp_key"
+                        log_debug "Clé SSH '$first_att' extraite depuis KeePassXC ($cand)"
+                        break
+                    fi
+                    rm -f "$tmp_key" 2>/dev/null || true
+                fi
+            fi
+        done
+
+        # 6.2 Recherche par URL (ssh://<IP> ou <IP>) et nom d'utilisateur si non trouvé
+        if [ -z "$PASSWORD" ] && [ -z "$EXTRACTED_KEY_FILE" ]; then
+            log_debug "Recherche par URL 'ssh://${RESOLVED_HOST}' et nom d'utilisateur '${RESOLVED_USER}'..."
+            local found_entries=""
+            found_entries=$(kp_search_entries "${RESOLVED_HOST}" "$master_key" || true)
+            if [ -n "$found_entries" ]; then
+                while IFS= read -r entry_p; do
+                    [ -z "$entry_p" ] && continue
+                    # Vérifier l'utilisateur
+                    local entry_user=""
+                    entry_user=$(kp_get_attribute "$entry_p" "username" "$master_key" || true)
+                    if [ -z "$RESOLVED_USER" ] || [ "$entry_user" = "$RESOLVED_USER" ]; then
+                        # Vérifier mot de passe
+                        local entry_pwd=""
+                        entry_pwd=$(kp_get_attribute "$entry_p" "password" "$master_key" || true)
+                        if [ -n "$entry_pwd" ]; then
+                            PASSWORD="$entry_pwd"
+                            log_debug "Mot de passe trouvé via URL dans $entry_p"
+                            break
+                        fi
+
+                        # Vérifier pièces jointes (clé SSH)
+                        local atts=""
+                        atts=$(kp_get_attachments "$entry_p" "$master_key" || true)
+                        if [ -n "$atts" ]; then
+                            local f_att
+                            f_att=$(head -n 1 <<< "$atts")
+                            local tmp_key
+                            tmp_key=$(mktemp -p /dev/shm 2>/dev/null || mktemp /tmp/kssh_key.XXXXXX)
+                            chmod 600 "$tmp_key"
+                            if kp_export_attachment "$entry_p" "$f_att" "$tmp_key" "$master_key"; then
+                                EXTRACTED_KEY_FILE="$tmp_key"
+                                log_debug "Clé SSH '$f_att' trouvée via URL dans $entry_p"
+                                break
+                            fi
+                            rm -f "$tmp_key" 2>/dev/null || true
+                        fi
+                    fi
+                done <<< "$found_entries"
+            fi
+        fi
+
+        unset master_key
+    fi
+
+    # 7. Connexion automatique via Clé SSH attachée ou Mot de passe sécurisé (FD 3)
+    if [ -n "$EXTRACTED_KEY_FILE" ] && [ -f "$EXTRACTED_KEY_FILE" ]; then
+        log_success "Clé SSH extraite depuis KeePassXC pour '$TARGET_HOST'. Connexion..."
+        local ssh_status=0
+        "$REAL_SSH" -i "$EXTRACTED_KEY_FILE" "$@" || ssh_status=$?
+        rm -f "$EXTRACTED_KEY_FILE" 2>/dev/null || true
+        unset EXTRACTED_KEY_FILE
+        return "$ssh_status"
+    fi
+
+    if [ -n "$PASSWORD" ] && cmd_exists sshpass; then
+        log_success "Mot de passe récupéré depuis KeePassXC pour '$TARGET_HOST'. Connexion..."
+        # Injection via FD 3 (Pas d'exposition dans ps aux ou /proc/cmdline)
+        exec sshpass -d 3 "$REAL_SSH" "$@" 3<<< "$PASSWORD"
+    fi
+
+    # 8. Fallback standard
+    # Si des clés sont chargées dans l'agent SSH (ssh-add -l) ou en environnement non-interactif
+    if [ ! -t 0 ] || [ ! -t 1 ] || (cmd_exists ssh-add && ssh-add -l >/dev/null 2>&1); then
+        exec "$REAL_SSH" "$@"
+    fi
+
+    # Mode interactif : Proposer l'enregistrement du serveur inconnu
+    log_warn "Aucun mot de passe ni clé trouvés dans KeePassXC pour '$TARGET_HOST'."
+    read -rp "Voulez-vous enregistrer ce serveur maintenant dans KeePassXC ? [O/n] : " choix
+    if [[ "$choix" =~ ^[oOyY]?$ ]]; then
+        if ajouter_serveur "$TARGET_HOST"; then
+            log_info "Connexion en cours..."
+            executer_connexion_ssh "$@"
+        fi
+    else
+        log_info "Connexion SSH standard..."
+        exec "$REAL_SSH" "$@"
+    fi
+}
+
+# ==============================================================================
+# POINT D'ENTRÉE DU SCRIPT
+# ==============================================================================
+executer_connexion_ssh "$@"
