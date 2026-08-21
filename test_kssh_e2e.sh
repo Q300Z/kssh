@@ -415,6 +415,11 @@ printf "%b[SECTION 6] SECURITY HYGIENE & SIGNAL TRAPPING%b\n" "${C_BOLD}" "${C_R
 # Test de comportement en environnement non-interactif pour serveur inconnu
 assert_success "Fallback gracieux en non-interactif pour serveur inconnu" "$KSSH_BIN" unknown_srv_123
 
+# Test de délégation immédiate sans blocage pour Git clone non-interactif sans cache
+> "$SSH_LOG_FILE"
+assert_success "Délégation transparente pour git@github.com non-interactif" "$KSSH_BIN" git@github.com "git-upload-pack 'Q300Z/conan-exiles-server.git'"
+assert_file_contains "Mock SSH appelé pour git@github.com" "git@github.com" "$SSH_LOG_FILE"
+
 # Installation explicite sans root (--install)
 assert_output_contains "Installation explicite --install" "Installation terminée avec succès" "$KSSH_BIN" --install
 assert_file_contains "Installation de l'autocomplétion Bash" "_kssh_complete" "${BASH_COMPLETION_DIR}/kssh"

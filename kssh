@@ -396,6 +396,12 @@ kp_get_attribute() {
     local entry_path="$1"
     local attribute="${2:-password}"
     local master_pwd="${3:-}"
+
+    # Garde-fou : pas d'exécution sans mot de passe maître ni fichier de clé
+    if [ -z "$master_pwd" ] && { [ -z "$KEEPASS_KEYFILE" ] || [ ! -f "$KEEPASS_KEYFILE" ]; }; then
+        return 1
+    fi
+
     local clean_path="${entry_path#/}"
     local kp_args=("-q" "-s" "-a" "$attribute")
     [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_args+=("-k" "$KEEPASS_KEYFILE")
@@ -420,6 +426,12 @@ kp_get_attribute() {
 kp_get_attachments() {
     local entry_path="$1"
     local master_pwd="${2:-}"
+
+    # Garde-fou : pas d'exécution sans mot de passe maître ni fichier de clé
+    if [ -z "$master_pwd" ] && { [ -z "$KEEPASS_KEYFILE" ] || [ ! -f "$KEEPASS_KEYFILE" ]; }; then
+        return 1
+    fi
+
     local clean_path="${entry_path#/}"
     local kp_args=("-q" "--show-attachments")
     [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_args+=("-k" "$KEEPASS_KEYFILE")
@@ -433,7 +445,7 @@ kp_get_attachments() {
             kp_out=$(keepassxc-cli show "${kp_args[@]}" "$KEEPASS_DB" "$p" 2>/dev/null) || true
         fi
         if [ -n "$kp_out" ]; then
-            printf '%s\n' "$kp_out"
+            printf '%s' "$kp_out"
             return 0
         fi
     done
@@ -444,6 +456,12 @@ kp_get_attachments() {
 kp_search_entries() {
     local term="$1"
     local master_pwd="${2:-}"
+
+    # Garde-fou : pas d'exécution sans mot de passe maître ni fichier de clé
+    if [ -z "$master_pwd" ] && { [ -z "$KEEPASS_KEYFILE" ] || [ ! -f "$KEEPASS_KEYFILE" ]; }; then
+        return 1
+    fi
+
     local kp_args=("-q")
     [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_args+=("-k" "$KEEPASS_KEYFILE")
 
@@ -460,6 +478,12 @@ kp_export_attachment() {
     local att_name="$2"
     local dest_file="$3"
     local master_pwd="${4:-}"
+
+    # Garde-fou : pas d'exécution sans mot de passe maître ni fichier de clé
+    if [ -z "$master_pwd" ] && { [ -z "$KEEPASS_KEYFILE" ] || [ ! -f "$KEEPASS_KEYFILE" ]; }; then
+        return 1
+    fi
+
     local clean_path="${entry_path#/}"
     local kp_args=("-q")
     [ -n "$KEEPASS_KEYFILE" ] && [ -f "$KEEPASS_KEYFILE" ] && kp_args+=("-k" "$KEEPASS_KEYFILE")
@@ -921,6 +945,19 @@ executer_connexion_ssh() {
         exec "$REAL_SSH" "$@"
     fi
 
+    # Détection de l'environnement interactif
+    local is_interactive=false
+    if [ -t 0 ] && [ -t 1 ]; then
+        is_interactive=true
+    fi
+
+    # Si en mode non-interactif et que des identités sont chargées dans ssh-agent (ex: git clone, git push, rsync, scripts),
+    # délégation directe à OpenSSH sans interroger KeePassXC
+    if [ "$is_interactive" = "false" ] && cmd_exists ssh-add && ssh-add -l >/dev/null 2>&1; then
+        log_debug "Mode non-interactif avec agent SSH actif : délégation directe à OpenSSH."
+        exec "$REAL_SSH" "$@"
+    fi
+
     # 6. Recherche ciblée du mot de passe ou de la clé attachée dans KeePassXC
     PASSWORD=""
     EXTRACTED_KEY_FILE=""
@@ -940,10 +977,16 @@ executer_connexion_ssh() {
         local master_key=""
         if master_key=$(lire_mot_de_passe_maitre_cache); then
             log_debug "Mot de passe maître chargé depuis le cache mémoire (/dev/shm)."
-        elif [ -t 0 ] && [ -t 1 ]; then
+        elif [ "$is_interactive" = "true" ]; then
             read -rsp "Mot de passe maître KeePassXC ($KEEPASS_DB) : " master_key
             echo ""
             [ -n "$master_key" ] && sauvegarder_mot_de_passe_maitre_cache "$master_key"
+        fi
+
+        # Si en mode non-interactif et pas de mot de passe maître en cache (ni keyfile), délégation directe à OpenSSH
+        if [ "$is_interactive" = "false" ] && [ -z "$master_key" ] && { [ -z "$KEEPASS_KEYFILE" ] || [ ! -f "$KEEPASS_KEYFILE" ]; }; then
+            log_debug "Mode non-interactif sans cache KeePassXC : délégation directe à OpenSSH."
+            exec "$REAL_SSH" "$@"
         fi
 
         # 6.1 Recherche directe par chemins d'alias
