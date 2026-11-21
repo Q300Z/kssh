@@ -11,12 +11,18 @@ readonly KSSH_BIN="${SCRIPT_DIR}/kssh"
 readonly TEST_DIR="/tmp/kssh_test_env_$$"
 mkdir -p "$TEST_DIR"
 
-export SSH_CONFIG_DIR="$TEST_DIR/.ssh"
-export SSH_CONFIG_FILE="$TEST_DIR/.ssh/config"
-export BASH_COMPLETION_DIR="$TEST_DIR/completions"
-export ZSH_COMPLETION_DIR="$TEST_DIR/zsh"
+export HOME="$TEST_DIR/home"
+export XDG_BIN_HOME="$HOME/.local/bin"
+export XDG_DATA_HOME="$HOME/.local/share"
+export SSH_CONFIG_DIR="$HOME/.ssh"
+export SSH_CONFIG_FILE="$SSH_CONFIG_DIR/config"
+export BASH_COMPLETION_DIR="$XDG_DATA_HOME/bash-completion/completions"
+export ZSH_COMPLETION_DIR="$XDG_DATA_HOME/zsh/site-functions"
+export KSSH_CACHE_DIR="$TEST_DIR/cache"
+export KSSH_CACHE_FILE="$KSSH_CACHE_DIR/master.key"
 export KEEPASS_DB="$TEST_DIR/mock.kdbx"
-mkdir -p "$SSH_CONFIG_DIR" "$BASH_COMPLETION_DIR" "$ZSH_COMPLETION_DIR"
+unset SSH_AUTH_SOCK || true
+mkdir -p "$HOME" "$SSH_CONFIG_DIR" "$BASH_COMPLETION_DIR" "$ZSH_COMPLETION_DIR"
 
 cleanup() {
     rm -rf "$TEST_DIR" 2>/dev/null || true

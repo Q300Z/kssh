@@ -49,34 +49,62 @@ export SSH_LOG_FILE="${TEST_SANDBOX}/ssh_execution.log"
 cat << EOF > "$MOCK_SSH_BIN"
 #!/usr/bin/env bash
 # Mock OpenSSH
+if [ "\$1" = "-O" ]; then
+    exit 1
+fi
 echo "MOCK_SSH_CALLED" >> "$SSH_LOG_FILE"
 printf '%s\n' "\$@" >> "$SSH_LOG_FILE"
 
-# Si -G est demandé, renvoyer la configuration résolue nativement
+# Si -G est demandé, renvoyer la configuration résolue (en lisant \$SSH_CONFIG_FILE)
 if [ "\$1" = "-G" ]; then
     shift
     user="\$(id -un)"
     port="22"
     hostname=""
+    target=""
     while [ "\$#" -gt 0 ]; do
         case "\$1" in
+            --) shift; target="\$1"; break ;;
             -p) port="\$2"; shift 2 ;;
             -l) user="\$2"; shift 2 ;;
             -*) shift ;;
-            *)
-                if [[ "\$1" =~ ^([^@]+)@(.*)\$ ]]; then
-                    user="\${BASH_REMATCH[1]}"
-                    hostname="\${BASH_REMATCH[2]}"
-                else
-                    hostname="\$1"
-                fi
-                shift
-                ;;
+            *)  target="\$1"; shift ;;
         esac
     done
+    if [[ "\$target" =~ ^([^@]+)@(.*)\$ ]]; then
+        user="\${BASH_REMATCH[1]}"
+        hostname="\${BASH_REMATCH[2]}"
+    else
+        hostname="\$target"
+    fi
+    identitiesonly="no"
+    id_files=()
+    if [ -n "\${SSH_CONFIG_FILE:-}" ] && [ -f "\$SSH_CONFIG_FILE" ]; then
+        eval "\$(awk -v tgt="\$hostname" '
+            BEGIN { in_match=0; in_star=0 }
+            tolower(\$1) == "host" {
+                in_match=0; in_star=0
+                for (i=2; i<=NF; i++) {
+                    if (\$i == tgt) in_match=1
+                    if (\$i == "*") in_star=1
+                }
+            }
+            (in_match || in_star) && tolower(\$1) == "hostname" && in_match { printf "hostname=%s\n", \$2 }
+            (in_match || in_star) && tolower(\$1) == "user"     && in_match { printf "user=%s\n", \$2 }
+            (in_match || in_star) && tolower(\$1) == "port"     && in_match { printf "port=%s\n", \$2 }
+            (in_match || in_star) && tolower(\$1) == "identitiesonly" { printf "identitiesonly=%s\n", tolower(\$2) }
+            (in_match || in_star) && tolower(\$1) == "identityfile"   { printf "id_files+=(%s)\n", \$2 }
+        ' "\$SSH_CONFIG_FILE" 2>/dev/null)"
+    fi
     echo "user \$user"
     echo "hostname \$hostname"
     echo "port \$port"
+    echo "identitiesonly \$identitiesonly"
+    for f in "\${id_files[@]}"; do
+        echo "identityfile \$f"
+    done
+    echo "identityfile ~/.ssh/id_rsa"
+    echo "identityfile ~/.ssh/id_ed25519"
     exit 0
 fi
 
@@ -205,6 +233,9 @@ assert_file_contains "Forwarding option -4" "-4" "$SSH_LOG_FILE"
 assert_file_contains "Forwarding option -X" "-X" "$SSH_LOG_FILE"
 assert_file_contains "Cible correcte identifiée" "mytarget" "$SSH_LOG_FILE"
 
+# Parsing d'options OpenSSH groupées (-4p 2222)
+assert_output_contains "Options groupées -4p 2222 ciblent target_grp" "TARGET_HOST='target_grp'" "$KSSH_BIN" --debug -4p 2222 target_grp -V
+
 # Forwarding avec option -i explicite
 > "$SSH_LOG_FILE"
 touch "${TEST_SANDBOX}/explicit_key"
@@ -232,6 +263,18 @@ assert_failure "Rejet alias avec point-virgule" "$KSSH_BIN" --add "srv;ls" 192.1
 assert_failure "Rejet alias avec dollar/subshell" "$KSSH_BIN" --add 'srv$(id)' 192.168.1.1
 assert_failure "Rejet alias avec pipe" "$KSSH_BIN" --add "srv|rm" 192.168.1.1
 assert_failure "Rejet alias vide" "$KSSH_BIN" --add "" 192.168.1.1
+assert_failure "Rejet injection saut de ligne dans -i" "$KSSH_BIN" --add inj_srv 192.168.1.1 -i $'/tmp/k\n    ProxyCommand id'
+assert_failure "Rejet hôte avec wildcard *" "$KSSH_BIN" --add bad_host1 "192.168.1.*"
+assert_failure "Rejet hôte avec caractère #" "$KSSH_BIN" --add bad_host2 "host#comment"
+
+# Test concurrence flock (deux --add simultanés)
+"$KSSH_BIN" --add conc_srv1 10.1.1.1 -i /tmp/mock_key >/dev/null 2>&1 &
+p1=$!
+"$KSSH_BIN" --add conc_srv2 10.1.1.2 -i /tmp/mock_key >/dev/null 2>&1 &
+p2=$!
+wait "$p1" "$p2"
+assert_file_contains "Concurrence flock : conc_srv1 présent" "Host conc_srv1" "$SSH_CONFIG_FILE"
+assert_file_contains "Concurrence flock : conc_srv2 présent" "Host conc_srv2" "$SSH_CONFIG_FILE"
 
 # Validation stricte des ports
 assert_failure "Rejet port 0" "$KSSH_BIN" --add test_srv root@192.168.1.1:0
@@ -313,10 +356,37 @@ fi
 TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
 # Test d'invalidation préventive si permissions du cache compromises (ex: 777)
-mkdir -p "$KSSH_CACHE_DIR"
+touch "$KEEPASS_DB"
+mkdir -p "$KSSH_CACHE_DIR" && chmod 700 "$KSSH_CACHE_DIR"
 printf '%s' "InsecurePass" > "$KSSH_CACHE_FILE"
 chmod 777 "$KSSH_CACHE_FILE"
-"$KSSH_BIN" --lock < /dev/null >/dev/null 2>&1 || true
+# Vérifier que la lecture du cache rejette les permissions 777 et supprime le répertoire de cache
+> "$SSH_LOG_FILE"
+assert_output_contains "Détection permissions cache compromises (777)" "Permissions non sécurisées" "$KSSH_BIN" 10.20.30.40
+if [ ! -d "$KSSH_CACHE_DIR" ]; then
+    printf '  %b✓%b [PASS] Cache compromis détruit automatiquement\n' "${C_GREEN}" "${C_RESET}"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+    printf '  %b✗%b [FAIL] Cache compromis toujours présent\n' "${C_RED}" "${C_RESET}"
+    FAILED_TESTS=$((FAILED_TESTS + 1))
+fi
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+# Test d'expiration réelle du TTL du cache (KSSH_CACHE_TTL=1)
+mkdir -p "$KSSH_CACHE_DIR" && chmod 700 "$KSSH_CACHE_DIR"
+printf '%s' "TTLExpiredPass" > "$KSSH_CACHE_FILE"
+chmod 600 "$KSSH_CACHE_FILE"
+sleep 2
+KSSH_CACHE_TTL=1 "$KSSH_BIN" 10.20.30.40 < /dev/null >/dev/null 2>&1 || true
+if [ ! -f "$KSSH_CACHE_FILE" ]; then
+    printf '  %b✓%b [PASS] Cache expiré supprimé après KSSH_CACHE_TTL\n' "${C_GREEN}" "${C_RESET}"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+    printf '  %b✗%b [FAIL] Cache expiré toujours présent après KSSH_CACHE_TTL\n' "${C_RED}" "${C_RESET}"
+    FAILED_TESTS=$((FAILED_TESTS + 1))
+fi
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+rm -f "$KEEPASS_DB"
 
 echo ""
 
@@ -386,8 +456,77 @@ assert_file_contains "Mock SSH exécuté pour srv_special" "MOCK_SSH_CALLED" "$S
 > "$SSH_LOG_FILE"
 assert_success "Connexion kssh avec clé SSH extraite depuis pièce jointe KeePassXC" "$KSSH_BIN" git_server
 assert_file_contains "Mock SSH exécuté pour git_server" "MOCK_SSH_CALLED" "$SSH_LOG_FILE"
-# Vérifier que le fichier temporaire de clé extrait a bien été détruit après exécution
-assert_output_contains "Absence de résidu de clé privée temporaire sur disque" "" find /tmp /dev/shm -maxdepth 1 -name "kssh_key*" 2>/dev/null || true
+# Vérifier réellement l'absence de résidu de clé privée temporaire sur /tmp et /dev/shm
+leftover_keys=$(find /tmp /dev/shm -maxdepth 1 -name "kssh_key*" 2>/dev/null || true)
+if [ -z "$leftover_keys" ]; then
+    printf '  %b✓%b [PASS] Absence réelle de résidu de clé privée temporaire\n' "${C_GREEN}" "${C_RESET}"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+    printf '  %b✗%b [FAIL] Résidu de clé temporaire détecté : %s\n' "${C_RED}" "${C_RESET}" "$leftover_keys"
+    FAILED_TESTS=$((FAILED_TESTS + 1))
+fi
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+# E. Ajout d'un serveur avec clé SSH dans une vraie base KeePassXC (compatibilité 2.8.x)
+assert_success "Ajout kssh --add avec clé SSH dans base KeePassXC réelle" "$KSSH_BIN" --add add_key_srv ops@10.99.88.77:2222 -i "$SSH_PRIV_KEY_FILE"
+assert_output_contains "Entrée Database/add_key_srv présente avec pièce jointe dans KeePassXC" "mock_id_rsa" bash -c "printf '%s\n' '$MASTER_PASS' | keepassxc-cli show -q --show-attachments '$KEEPASS_DB' 'Database/add_key_srv'"
+
+# F. Anti-fuite cross-host : 10.20.30.4 ne doit pas matcher l'entrée 10.20.30.40
+assert_output_contains "Rejet correspondance partielle IP (10.20.30.4 vs 10.20.30.40)" "MOCK_SSH_CALLED" bash -c "> '$SSH_LOG_FILE'; '$KSSH_BIN' admin_sp@10.20.30.4 >/dev/null 2>&1 || true; grep -q 'MOCK_SSH_CALLED' '$SSH_LOG_FILE' && ! '$KSSH_BIN' --debug admin_sp@10.20.30.4 2>&1 | grep -q 'Mot de passe trouvé' && echo MOCK_SSH_CALLED"
+
+# G. Vérification réelle de l'injection FD 3 via sshpass sous PTY
+PTY_SSH_BIN="${TEST_SANDBOX}/mock_ssh_pty"
+PTY_PASS_FILE="${TEST_SANDBOX}/pty_received_pass"
+cat << EOF > "$PTY_SSH_BIN"
+#!/usr/bin/env bash
+if [ "\$1" = "-G" ]; then
+    echo "user admin_sp"
+    echo "hostname 10.20.30.40"
+    echo "port 22"
+    exit 0
+fi
+if [ "\$1" = "-O" ]; then
+    exit 1
+fi
+printf "Password: " > /dev/tty
+IFS= read -r received_pw < /dev/tty
+printf '%s' "\$received_pw" > "$PTY_PASS_FILE"
+exit 0
+EOF
+chmod +x "$PTY_SSH_BIN"
+OPENSSH_BIN="$PTY_SSH_BIN" python3 -c "
+import pty, os, subprocess, fcntl, termios, select, time
+master, slave = pty.openpty()
+env = os.environ.copy()
+env['OPENSSH_BIN'] = '$PTY_SSH_BIN'
+def set_ctty():
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+p = subprocess.Popen(['$KSSH_BIN', 'srv_special'], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=set_ctty, close_fds=True)
+os.close(slave)
+deadline = time.time() + 10
+while time.time() < deadline:
+    r, _, _ = select.select([master], [], [], 0.2)
+    if r:
+        try:
+            if not os.read(master, 4096):
+                break
+        except OSError:
+            break
+    elif p.poll() is not None:
+        break
+os.close(master)
+p.wait(timeout=5)
+"
+assert_file_contains "Injection réelle sshpass FD 3 sous PTY (SPECIAL_PASS)" "$SPECIAL_PASS" "$PTY_PASS_FILE"
+
+# H. IdentitiesOnly yes avec clé par défaut (~/.ssh/id_ed25519) ne doit pas court-circuiter KeePassXC
+touch "${SSH_CONFIG_DIR}/id_ed25519"
+printf '\nHost *\n    IdentitiesOnly yes\n' >> "$SSH_CONFIG_FILE"
+assert_output_contains "IdentitiesOnly yes avec clé défaut résout toujours KeePassXC" "Mot de passe trouvé" "$KSSH_BIN" --debug prod_cluster
+
+# I. Commande de gestion avec --debug (--debug --list)
+assert_output_contains "Routage --debug --list fonctionnel" "legacy_srv" "$KSSH_BIN" --debug --list
 
 echo ""
 

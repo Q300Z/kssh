@@ -155,6 +155,12 @@ Pour remplacer automatiquement la commande `ssh` par `kssh` dans votre shell int
 alias ssh='kssh'
 ```
 
+> **Note (`scp`, `sftp`, `rsync`, `git`)** : Un alias shell n'affecte pas les sous-processus externes. Pour utiliser `kssh` avec ces outils :
+> - `scp -S kssh fichier serveur:/chemin`
+> - `sftp -S kssh serveur`
+> - `rsync -av -e kssh dossier/ serveur:/chemin`
+> - `GIT_SSH_COMMAND="kssh" git clone git@serveur:repo.git`
+
 ---
 
 ### 3. Autocomplétion (Bash & Zsh)
@@ -245,7 +251,7 @@ kssh --add srv_ipv6 "admin@[2001:db8::1]:2222"
 
 ### 3. Lister les serveurs (`--list`)
 
-Affichez tous les serveurs et alias configurés dans votre fichier `~/.ssh/config` sous forme de tableau formaté :
+Affichez tous les serveurs et alias configurés dans votre fichier `~/.ssh/config` :
 
 ```bash
 kssh --list
